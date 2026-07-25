@@ -88,19 +88,82 @@ echo "==> Upload:   $UPLOAD"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 1. Install NGINX + Certbot (single apt update if anything is missing)
+# 1. Install/Upgrade NGINX + Certbot (with auto-upgrade for old versions)
 # ---------------------------------------------------------------------------
+# Check current nginx version if installed
+CURRENT_VERSION=""
+NEEDS_UPGRADE=false
+if command -v nginx &>/dev/null; then
+  CURRENT_VERSION=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "")
+  echo "==> Current NGINX version: ${CURRENT_VERSION:-unknown}"
+  
+  # Check if running old version (< 1.30)
+  if [[ -n "$CURRENT_VERSION" ]]; then
+    MAJOR=$(echo "$CURRENT_VERSION" | cut -d. -f1)
+    MINOR=$(echo "$CURRENT_VERSION" | cut -d. -f2)
+    if [[ $MAJOR -eq 1 && $MINOR -lt 30 ]]; then
+      NEEDS_UPGRADE=true
+      echo "==> Old NGINX version detected ($CURRENT_VERSION). Will upgrade to latest stable."
+      
+      # Backup existing nginx configs before upgrade
+      if [[ -d /etc/nginx ]]; then
+        BACKUP_DIR="/etc/nginx.backup.$(date +%Y%m%d-%H%M%S)"
+        echo "==> Backing up current NGINX configs to $BACKUP_DIR"
+        cp -a /etc/nginx "$BACKUP_DIR"
+      fi
+    fi
+  fi
+fi
+
+# Always ensure nginx repo is configured for latest stable version
+if [[ ! -f /etc/apt/sources.list.d/nginx.list ]] || [[ "$NEEDS_UPGRADE" == true ]]; then
+  echo "==> Configuring official NGINX repository for latest stable version..."
+  apt-get update -y
+  apt-get install -y curl gnupg2 ca-certificates lsb-release ubuntu-keyring
+  
+  # Remove old nginx if needed for clean upgrade
+  if [[ "$NEEDS_UPGRADE" == true ]]; then
+    echo "==> Removing old NGINX version for clean upgrade..."
+    systemctl stop nginx || true
+    apt-get remove -y nginx nginx-common nginx-core || true
+    apt-get autoremove -y || true
+  fi
+  
+  # Setup official nginx repo
+  curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+  echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" > /etc/apt/sources.list.d/nginx.list
+  echo -e "Package: *\nPin: origin nginx.org\nPin: release o=nginx\nPin-Priority: 900\n" > /etc/apt/preferences.d/99nginx
+  
+  # Force update package list
+  apt-get update -y
+fi
+
 PKGS=()
-command -v nginx   &>/dev/null || PKGS+=(nginx)
+# Always reinstall nginx if upgrade is needed
+if [[ "$NEEDS_UPGRADE" == true ]] || ! command -v nginx &>/dev/null; then
+  PKGS+=(nginx)
+fi
 command -v certbot &>/dev/null || PKGS+=(certbot python3-certbot-nginx)
 
 if [[ ${#PKGS[@]} -gt 0 ]]; then
-  echo "==> Installing: ${PKGS[*]}"
+  echo "==> Installing/Upgrading: ${PKGS[*]}"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -y
   apt-get install -y "${PKGS[@]}"
+  
+  # Restore sites-available and sites-enabled dirs if missing (nginx.org package doesn't create them)
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  
+  # Ensure sites-enabled is included in main config
+  if ! grep -q "include /etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf; then
+    sed -i '/http {/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
+  fi
+  
+  echo "==> NGINX upgraded to version:"
+  nginx -v
 else
   echo "==> NGINX and Certbot already installed."
+  nginx -v
 fi
 
 # ---------------------------------------------------------------------------
@@ -212,9 +275,65 @@ certbot certonly \
   -d "$DOMAIN"
 
 # ---------------------------------------------------------------------------
-# 6. Rewrite config with HTTPS + HTTP redirect
+# 5.5 Update existing SSL configs if they exist (for re-runs)
 # ---------------------------------------------------------------------------
-echo "==> Writing HTTPS NGINX config..."
+update_ssl_config() {
+  local config_file="$1"
+  if [[ -f "$config_file" ]]; then
+    echo "==> Updating SSL/TLS configuration in $config_file"
+    
+    # Backup before updating
+    cp "$config_file" "${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
+    
+    # Update SSL protocols to include TLS 1.3
+    sed -i 's/ssl_protocols.*TLSv1 TLSv1.1.*/ssl_protocols TLSv1.2 TLSv1.3;/g' "$config_file"
+    sed -i 's/ssl_protocols.*TLSv1.2;/ssl_protocols TLSv1.2 TLSv1.3;/g' "$config_file"
+    
+    # Update to modern cipher suites if using old ones
+    if grep -q "ssl_ciphers.*ECDHE-RSA-AES128-SHA" "$config_file"; then
+      sed -i '/ssl_ciphers/c\    ssl_ciphers TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;' "$config_file"
+    fi
+    
+    # Add missing security headers
+    if ! grep -q "X-XSS-Protection" "$config_file"; then
+      sed -i '/add_header X-Content-Type-Options/a\    add_header X-XSS-Protection "1; mode=block" always;' "$config_file"
+    fi
+    if ! grep -q "Referrer-Policy" "$config_file"; then
+      sed -i '/add_header X-Content-Type-Options/a\    add_header Referrer-Policy "strict-origin-when-cross-origin" always;' "$config_file"
+    fi
+    
+    # Update HSTS to include preload
+    sed -i 's/add_header Strict-Transport-Security.*max-age=63072000;.*/add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;/g' "$config_file"
+    
+    echo "==> SSL/TLS configuration updated in $config_file"
+  fi
+}
+
+# Update existing config if it exists before rewriting
+if [[ -f "$CONF_PATH" ]] && grep -q "ssl_certificate" "$CONF_PATH" 2>/dev/null; then
+  update_ssl_config "$CONF_PATH"
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Rewrite config with HTTPS + HTTP redirect (with updated SSL/TLS settings)
+# ---------------------------------------------------------------------------
+echo "==> Writing HTTPS NGINX config with latest SSL/TLS standards..."
+
+# Check nginx version to determine http2 syntax
+NGINX_VERSION=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "1.24.0")
+MAJOR=$(echo "$NGINX_VERSION" | cut -d. -f1)
+MINOR=$(echo "$NGINX_VERSION" | cut -d. -f2)
+PATCH=$(echo "$NGINX_VERSION" | cut -d. -f3)
+
+# Use new http2 syntax for nginx >= 1.25.1
+if [[ $MAJOR -gt 1 ]] || [[ $MAJOR -eq 1 && $MINOR -gt 25 ]] || [[ $MAJOR -eq 1 && $MINOR -eq 25 && $PATCH -ge 1 ]]; then
+  HTTP2_LISTEN="listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;"
+else
+  HTTP2_LISTEN="listen 443 ssl http2;
+    listen [::]:443 ssl http2;"
+fi
 
 cat > "$CONF_PATH" <<EOF
 # Redirect HTTP → HTTPS
@@ -234,11 +353,7 @@ server {
 
 # HTTPS reverse proxy
 server {
-    # Combined form works on all nginx versions; newer ones (>=1.25.1) emit a
-    # harmless deprecation warning. The standalone "http2 on;" only exists on
-    # 1.25.1+, so avoid it for compatibility with older installs.
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    ${HTTP2_LISTEN}
     server_name ${DOMAIN};
 
     client_max_body_size ${UPLOAD};
@@ -247,24 +362,35 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
     ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
 
-    # Modern SSL settings (ECDHE only — no DHE, so no dhparam needed)
+    # Modern SSL/TLS settings (updated for 2024/2025 standards)
     ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    
+    # Updated cipher suite for better security and performance
+    ssl_ciphers         TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    
     ssl_prefer_server_ciphers off;
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
+    
+    # Enable early data (0-RTT) for TLS 1.3
+    ssl_early_data on;
 
     # OCSP stapling
     ssl_stapling        on;
     ssl_stapling_verify on;
-    resolver            1.1.1.1 8.8.8.8 valid=300s;
+    resolver            1.1.1.1 8.8.8.8 [2606:4700:4700::1111] [2606:4700:4700::1001] valid=300s;
     resolver_timeout    5s;
 
-    # Security headers
-    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+    # Enhanced Security headers
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Frame-Options           DENY always;
     add_header X-Content-Type-Options    nosniff always;
+    add_header X-XSS-Protection          "1; mode=block" always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
+    
+    # Add Early-Data header for 0-RTT replay attack prevention
+    proxy_set_header Early-Data \$ssl_early_data;
 
     location / {
         proxy_pass ${UPSTREAM};
