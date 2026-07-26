@@ -76,8 +76,8 @@ if [[ -z "$EMAIL" ]]; then
   echo "         Pass email=<you@example.com> to receive them at a real mailbox."
 fi
 
-CONF_PATH="/etc/nginx/sites-available/${DOMAIN}"
-LINK_PATH="/etc/nginx/sites-enabled/${DOMAIN}"
+# Use /etc/nginx/conf.d/ for nginx.org packages (official nginx repo)
+CONF_PATH="/etc/nginx/conf.d/${DOMAIN}.conf"
 UPGRADE_CONF="/etc/nginx/conf.d/proxy_upgrade.conf"
 PROXY_SNIPPET="/etc/nginx/snippets/reverse_proxy.conf"
 
@@ -151,13 +151,11 @@ if [[ ${#PKGS[@]} -gt 0 ]]; then
   apt-get update -y
   apt-get install -y "${PKGS[@]}"
   
-  # Restore sites-available and sites-enabled dirs if missing (nginx.org package doesn't create them)
-  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  # Ensure conf.d directory exists (should be created by nginx package)
+  mkdir -p /etc/nginx/conf.d
   
-  # Ensure sites-enabled is included in main config
-  if ! grep -q "include /etc/nginx/sites-enabled/\*" /etc/nginx/nginx.conf; then
-    sed -i '/http {/a\    include /etc/nginx/sites-enabled/*.conf;' /etc/nginx/nginx.conf
-  fi
+  # The nginx.org package already includes /etc/nginx/conf.d/*.conf by default
+  # No need to modify nginx.conf
   
   echo "==> NGINX upgraded to version:"
   nginx -v
@@ -249,13 +247,11 @@ server {
 }
 EOF
 
-# Enable the site
-if [[ ! -L "$LINK_PATH" ]]; then
-  ln -s "$CONF_PATH" "$LINK_PATH"
+# Remove default.conf if it exists (avoid port 80 conflict)
+if [[ -f /etc/nginx/conf.d/default.conf ]]; then
+  mv /etc/nginx/conf.d/default.conf /etc/nginx/conf.d/default.conf.disabled
+  echo "==> Disabled default.conf to avoid port conflicts"
 fi
-
-# Remove default site if it exists (avoid port 80 conflict)
-rm -f /etc/nginx/sites-enabled/default
 
 # Create webroot for ACME challenge
 mkdir -p /var/www/certbot
