@@ -146,7 +146,20 @@ PKGS=()
 if [[ "$NEEDS_UPGRADE" == true ]] || ! command -v nginx &>/dev/null; then
   PKGS+=(nginx)
 fi
-command -v certbot &>/dev/null || PKGS+=(certbot python3-certbot-nginx)
+# Check for certbot - prefer snap version (recommended by Let's Encrypt)
+if ! command -v certbot &>/dev/null; then
+  # Check if snap is available and use it for certbot (recommended)
+  if command -v snap &>/dev/null; then
+    echo "==> Installing Certbot via snap (recommended)..."
+    snap install core
+    snap refresh core
+    snap install --classic certbot
+    ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
+  else
+    # Fallback to apt if snap not available
+    PKGS+=(certbot)
+  fi
+fi
 
 if [[ ${#PKGS[@]} -gt 0 ]]; then
   echo "==> Installing/Upgrading: ${PKGS[*]}"
@@ -265,13 +278,27 @@ systemctl reload nginx
 # ---------------------------------------------------------------------------
 # 5. Obtain Let's Encrypt certificate (webroot — matches the config above)
 # ---------------------------------------------------------------------------
-echo "==> Obtaining Let's Encrypt certificate for $DOMAIN..."
-certbot certonly \
-  --webroot -w /var/www/certbot \
-  --non-interactive \
-  --agree-tos \
-  --email "$EMAIL" \
-  -d "$DOMAIN"
+# Check if certificate already exists
+if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
+  echo "==> Certificate already exists for $DOMAIN, checking if renewal is needed..."
+  certbot renew --cert-name "$DOMAIN" --dry-run
+  if [[ $? -eq 0 ]]; then
+    echo "==> Certificate is valid, no renewal needed yet."
+  else
+    echo "==> Renewing certificate for $DOMAIN..."
+    certbot renew --cert-name "$DOMAIN"
+  fi
+else
+  echo "==> Obtaining Let's Encrypt certificate for $DOMAIN..."
+  certbot certonly \
+    --webroot -w /var/www/certbot \
+    --non-interactive \
+    --agree-tos \
+    --email "$EMAIL" \
+    -d "$DOMAIN" \
+    --keep-until-expiring \
+    --expand
+fi
 
 # ---------------------------------------------------------------------------
 # 5.5 Update existing SSL configs if they exist (for re-runs)
@@ -382,15 +409,27 @@ nginx -t
 systemctl reload nginx
 
 # ---------------------------------------------------------------------------
-# 7. Set up auto-renewal cron (certbot renew)
+# 7. Set up auto-renewal (systemd timer or cron)
 # ---------------------------------------------------------------------------
-CRON_JOB="0 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'"
-if ! crontab -l 2>/dev/null | grep -qF "certbot renew"; then
-  (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
-  echo "==> Auto-renewal cron job added."
+# Check if Certbot was installed via snap (it includes systemd timer)
+if [[ -f /snap/bin/certbot ]]; then
+  # Snap version includes automatic renewal via systemd timer
+  echo "==> Certbot snap includes automatic renewal via systemd timer."
+  systemctl list-timers | grep -q snap.certbot.renew && echo "==> Auto-renewal timer is active."
 else
-  echo "==> Auto-renewal cron job already present."
+  # Set up cron job for non-snap installations
+  CRON_JOB="0 3 * * * certbot renew --webroot -w /var/www/certbot --quiet --post-hook 'systemctl reload nginx'"
+  if ! crontab -l 2>/dev/null | grep -qF "certbot renew"; then
+    (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
+    echo "==> Auto-renewal cron job added."
+  else
+    echo "==> Auto-renewal cron job already present."
+  fi
 fi
+
+# Test renewal configuration
+echo "==> Testing renewal configuration..."
+certbot renew --dry-run --webroot -w /var/www/certbot
 
 echo ""
 echo "Done! https://${DOMAIN} now proxies to ${UPSTREAM} (max upload: ${UPLOAD})"
