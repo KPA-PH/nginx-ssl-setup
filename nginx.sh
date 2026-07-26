@@ -125,8 +125,11 @@ if [[ ! -f /etc/apt/sources.list.d/nginx.list ]] || [[ "$NEEDS_UPGRADE" == true 
   if [[ "$NEEDS_UPGRADE" == true ]]; then
     echo "==> Removing old NGINX version for clean upgrade..."
     systemctl stop nginx || true
-    apt-get remove -y nginx nginx-common nginx-core || true
+    # Use purge to remove old packages but preserve configs
+    apt-get remove --purge -y nginx nginx-common nginx-core || true
     apt-get autoremove -y || true
+    # Clean up old package configs that might conflict
+    rm -f /etc/apt/sources.list.d/nginx.list.save || true
   fi
   
   # Setup official nginx repo
@@ -291,9 +294,6 @@ update_ssl_config() {
     fi
     
     # Add missing security headers
-    if ! grep -q "X-XSS-Protection" "$config_file"; then
-      sed -i '/add_header X-Content-Type-Options/a\    add_header X-XSS-Protection "1; mode=block" always;' "$config_file"
-    fi
     if ! grep -q "Referrer-Policy" "$config_file"; then
       sed -i '/add_header X-Content-Type-Options/a\    add_header Referrer-Policy "strict-origin-when-cross-origin" always;' "$config_file"
     fi
@@ -358,25 +358,18 @@ server {
     ssl_session_cache   shared:SSL:10m;
     ssl_session_timeout 1d;
     ssl_session_tickets off;
-    
-    # Enable early data (0-RTT) for TLS 1.3
-    ssl_early_data on;
 
     # OCSP stapling
     ssl_stapling        on;
     ssl_stapling_verify on;
-    resolver            1.1.1.1 8.8.8.8 [2606:4700:4700::1111] [2606:4700:4700::1001] valid=300s;
+    resolver            1.1.1.1 8.8.8.8 valid=300s;
     resolver_timeout    5s;
 
     # Enhanced Security headers
     add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
     add_header X-Frame-Options           DENY always;
     add_header X-Content-Type-Options    nosniff always;
-    add_header X-XSS-Protection          "1; mode=block" always;
     add_header Referrer-Policy           "strict-origin-when-cross-origin" always;
-    
-    # Add Early-Data header for 0-RTT replay attack prevention
-    proxy_set_header Early-Data \$ssl_early_data;
 
     location / {
         proxy_pass ${UPSTREAM};
