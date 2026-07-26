@@ -319,21 +319,11 @@ fi
 # ---------------------------------------------------------------------------
 echo "==> Writing HTTPS NGINX config with latest SSL/TLS standards..."
 
-# Check nginx version to determine http2 syntax
-NGINX_VERSION=$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || echo "1.24.0")
-MAJOR=$(echo "$NGINX_VERSION" | cut -d. -f1)
-MINOR=$(echo "$NGINX_VERSION" | cut -d. -f2)
-PATCH=$(echo "$NGINX_VERSION" | cut -d. -f3)
-
-# Use new http2 syntax for nginx >= 1.25.1
-if [[ $MAJOR -gt 1 ]] || [[ $MAJOR -eq 1 && $MINOR -gt 25 ]] || [[ $MAJOR -eq 1 && $MINOR -eq 25 && $PATCH -ge 1 ]]; then
-  HTTP2_LISTEN="listen 443 ssl;
-    listen [::]:443 ssl;
-    http2 on;"
-else
-  HTTP2_LISTEN="listen 443 ssl http2;
+# For nginx 1.30.x and below, use the combined ssl http2 syntax
+# The separate "http2 on;" directive only exists in nginx 1.25.1+ mainline versions
+# Since we're installing stable 1.30.4, we use the combined format
+HTTP2_LISTEN="listen 443 ssl http2;
     listen [::]:443 ssl http2;"
-fi
 
 cat > "$CONF_PATH" <<EOF
 # Redirect HTTP → HTTPS
