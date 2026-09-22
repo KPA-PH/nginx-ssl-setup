@@ -57,6 +57,11 @@ if [[ ! "$DOMAIN" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2
   exit 1
 fi
 
+# DNS names are case-insensitive, but Linux paths are not. Keeping the domain
+# lowercase prevents certificate/config paths such as CatPriceLab.com and
+# catpricelab.com from drifting apart.
+DOMAIN="${DOMAIN,,}"
+
 # Validate upstream must be an http(s) URL
 if [[ ! "$UPSTREAM" =~ ^https?://[^[:space:]]+$ ]]; then
   echo "Error: upstream must be an http:// or https:// URL (got '$UPSTREAM')."
@@ -80,6 +85,7 @@ fi
 CONF_PATH="/etc/nginx/conf.d/${DOMAIN}.conf"
 UPGRADE_CONF="/etc/nginx/conf.d/proxy_upgrade.conf"
 PROXY_SNIPPET="/etc/nginx/snippets/reverse_proxy.conf"
+CERT_DIR="/etc/letsencrypt/live/${DOMAIN}"
 
 echo "==> Domain:   $DOMAIN"
 echo "==> Upstream: $UPSTREAM"
@@ -243,6 +249,60 @@ EOF
 # ---------------------------------------------------------------------------
 echo "==> Writing initial NGINX config to $CONF_PATH..."
 
+# Earlier versions accepted mixed-case domains and consequently created
+# mixed-case config paths. Disable only case-variant configs for this same
+# domain so a stale file cannot keep referencing a missing certificate.
+for existing_conf in /etc/nginx/conf.d/*.conf; do
+  [[ -e "$existing_conf" ]] || continue
+  if [[ "${existing_conf,,}" == "${CONF_PATH,,}" && "$existing_conf" != "$CONF_PATH" ]]; then
+    disabled_conf="${existing_conf}.disabled.$(date +%Y%m%d-%H%M%S)"
+    mv "$existing_conf" "$disabled_conf"
+    echo "==> Disabled case-variant config: $existing_conf"
+    echo "    Backup: $disabled_conf"
+  fi
+done
+
+# Migrate configs created by older versions of this script. Limit the change to
+# files carrying our marker so unrelated hand-written virtual hosts are left
+# untouched. The replacement is semantically equivalent on NGINX 1.25.1+.
+for legacy_conf in /etc/nginx/conf.d/*.conf; do
+  [[ -e "$legacy_conf" && "$legacy_conf" != "$CONF_PATH" ]] || continue
+  if grep -qF '# HTTPS reverse proxy' "$legacy_conf" \
+      && grep -qE '^[[:space:]]*listen (443|\[::\]:443) ssl http2;' "$legacy_conf"; then
+    legacy_backup="${legacy_conf}.backup.$(date +%Y%m%d-%H%M%S)"
+    cp -p "$legacy_conf" "$legacy_backup"
+
+    # Add `http2 on;` beside the first legacy listener, then remove `http2`
+    # from any remaining listener in that same generated config.
+    if ! awk '
+      BEGIN { http2_added = 0 }
+      /^[[:space:]]*listen (443|\[::\]:443) ssl http2;[[:space:]]*$/ {
+        match($0, /^[[:space:]]*/)
+        indent = substr($0, RSTART, RLENGTH)
+        sub(/ssl http2;/, "ssl;")
+        print
+        if (!http2_added) {
+          print indent "http2 on;"
+          http2_added = 1
+        }
+        next
+      }
+      { print }
+    ' "$legacy_backup" > "$legacy_conf"; then
+      cp -p "$legacy_backup" "$legacy_conf"
+      echo "Error: failed to migrate $legacy_conf; restored its backup." >&2
+      exit 1
+    fi
+    echo "==> Migrated deprecated HTTP/2 syntax in $legacy_conf"
+  fi
+done
+
+# Preserve the current site config before temporarily switching it to HTTP for
+# the ACME challenge. This also makes manual recovery straightforward.
+if [[ -f "$CONF_PATH" ]]; then
+  cp "$CONF_PATH" "${CONF_PATH}.backup.$(date +%Y%m%d-%H%M%S)"
+fi
+
 cat > "$CONF_PATH" <<EOF
 server {
     listen 80;
@@ -278,75 +338,37 @@ systemctl reload nginx
 # ---------------------------------------------------------------------------
 # 5. Obtain Let's Encrypt certificate (webroot — matches the config above)
 # ---------------------------------------------------------------------------
-# Check if certificate already exists
-if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-  echo "==> Certificate already exists for $DOMAIN, checking if renewal is needed..."
-  certbot renew --cert-name "$DOMAIN" --dry-run
-  if [[ $? -eq 0 ]]; then
-    echo "==> Certificate is valid, no renewal needed yet."
-  else
-    echo "==> Renewing certificate for $DOMAIN..."
-    certbot renew --cert-name "$DOMAIN"
-  fi
+# A directory alone is not proof that the certificate is usable: Certbot's
+# live directory contains symlinks whose targets may be missing after a restore
+# or partial migration. Certbot is idempotent with --keep-until-expiring, so use
+# the same command for both first-time issuance and subsequent runs.
+if [[ -s "$CERT_DIR/fullchain.pem" && -s "$CERT_DIR/privkey.pem" && -s "$CERT_DIR/chain.pem" ]]; then
+  echo "==> Existing certificate found for $DOMAIN; keeping it unless renewal is due..."
 else
-  echo "==> Obtaining Let's Encrypt certificate for $DOMAIN..."
-  certbot certonly \
-    --webroot -w /var/www/certbot \
-    --non-interactive \
-    --agree-tos \
-    --email "$EMAIL" \
-    -d "$DOMAIN" \
-    --keep-until-expiring \
-    --expand
+  echo "==> Certificate is missing or incomplete for $DOMAIN; obtaining it..."
 fi
 
-# ---------------------------------------------------------------------------
-# 5.5 Update existing SSL configs if they exist (for re-runs)
-# ---------------------------------------------------------------------------
-update_ssl_config() {
-  local config_file="$1"
-  if [[ -f "$config_file" ]]; then
-    echo "==> Updating SSL/TLS configuration in $config_file"
-    
-    # Backup before updating
-    cp "$config_file" "${config_file}.backup.$(date +%Y%m%d-%H%M%S)"
-    
-    # Update SSL protocols to include TLS 1.3
-    sed -i 's/ssl_protocols.*TLSv1 TLSv1.1.*/ssl_protocols TLSv1.2 TLSv1.3;/g' "$config_file"
-    sed -i 's/ssl_protocols.*TLSv1.2;/ssl_protocols TLSv1.2 TLSv1.3;/g' "$config_file"
-    
-    # Update to modern cipher suites if using old ones
-    if grep -q "ssl_ciphers.*ECDHE-RSA-AES128-SHA" "$config_file"; then
-      sed -i '/ssl_ciphers/c\    ssl_ciphers TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;' "$config_file"
-    fi
-    
-    # Add missing security headers
-    if ! grep -q "Referrer-Policy" "$config_file"; then
-      sed -i '/add_header X-Content-Type-Options/a\    add_header Referrer-Policy "strict-origin-when-cross-origin" always;' "$config_file"
-    fi
-    
-    # Update HSTS to include preload
-    sed -i 's/add_header Strict-Transport-Security.*max-age=63072000;.*/add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;/g' "$config_file"
-    
-    echo "==> SSL/TLS configuration updated in $config_file"
+certbot certonly \
+  --webroot -w /var/www/certbot \
+  --non-interactive \
+  --agree-tos \
+  --email "$EMAIL" \
+  --cert-name "$DOMAIN" \
+  -d "$DOMAIN" \
+  --keep-until-expiring
+
+for cert_file in fullchain.pem privkey.pem chain.pem; do
+  if [[ ! -s "$CERT_DIR/$cert_file" ]]; then
+    echo "Error: Certbot completed without creating a usable $CERT_DIR/$cert_file." >&2
+    echo "       Run 'certbot certificates' and inspect the certificate lineage." >&2
+    exit 1
   fi
-}
-
-# Update existing config if it exists before rewriting
-if [[ -f "$CONF_PATH" ]] && grep -q "ssl_certificate" "$CONF_PATH" 2>/dev/null; then
-  update_ssl_config "$CONF_PATH"
-fi
+done
 
 # ---------------------------------------------------------------------------
 # 6. Rewrite config with HTTPS + HTTP redirect (with updated SSL/TLS settings)
 # ---------------------------------------------------------------------------
 echo "==> Writing HTTPS NGINX config with latest SSL/TLS standards..."
-
-# For nginx 1.30.x and below, use the combined ssl http2 syntax
-# The separate "http2 on;" directive only exists in nginx 1.25.1+ mainline versions
-# Since we're installing stable 1.30.4, we use the combined format
-HTTP2_LISTEN="listen 443 ssl http2;
-    listen [::]:443 ssl http2;"
 
 cat > "$CONF_PATH" <<EOF
 # Redirect HTTP → HTTPS
@@ -366,14 +388,16 @@ server {
 
 # HTTPS reverse proxy
 server {
-    ${HTTP2_LISTEN}
+    listen 443 ssl;
+    listen [::]:443 ssl;
+    http2 on;
     server_name ${DOMAIN};
 
     client_max_body_size ${UPLOAD};
 
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_trusted_certificate /etc/letsencrypt/live/${DOMAIN}/chain.pem;
+    ssl_certificate     ${CERT_DIR}/fullchain.pem;
+    ssl_certificate_key ${CERT_DIR}/privkey.pem;
+    ssl_trusted_certificate ${CERT_DIR}/chain.pem;
 
     # Modern SSL/TLS settings (updated for 2024/2025 standards)
     ssl_protocols       TLSv1.2 TLSv1.3;
@@ -429,7 +453,7 @@ fi
 
 # Test renewal configuration
 echo "==> Testing renewal configuration..."
-certbot renew --dry-run --webroot -w /var/www/certbot
+certbot renew --dry-run --cert-name "$DOMAIN" --webroot -w /var/www/certbot
 
 echo ""
 echo "Done! https://${DOMAIN} now proxies to ${UPSTREAM} (max upload: ${UPLOAD})"
