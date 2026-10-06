@@ -22,10 +22,14 @@ Given a domain and an upstream URL, the script:
 4. **Writes a shared reverse-proxy snippet** (forwarding headers + timeouts +
    upload streaming) that both the HTTP and HTTPS server blocks include, so the
    two configs can never drift out of sync.
-5. **Issues a Let's Encrypt certificate** using the webroot ACME challenge.
-6. **Writes the final config**: HTTP → HTTPS redirect plus a hardened HTTPS
+5. **Verifies the ACME challenge path** — writes a probe token to the webroot
+   and fetches it via `http://<domain>/`. If anything other than this NGINX
+   answers (DNS points elsewhere, another program owns port 80), it stops with
+   diagnostics instead of letting Certbot fail with an opaque 404.
+6. **Issues a Let's Encrypt certificate** using the webroot ACME challenge.
+7. **Writes the final config**: HTTP → HTTPS redirect plus a hardened HTTPS
    reverse proxy (TLS 1.2/1.3, OCSP stapling, HSTS, modern ciphers).
-7. **Schedules auto-renewal** via a daily `certbot renew` cron job that reloads
+8. **Schedules auto-renewal** via a daily `certbot renew` cron job that reloads
    NGINX after a successful renewal.
 
 The script is **idempotent** — running it again for the same domain re-applies
@@ -230,6 +234,8 @@ To tune proxy headers or timeouts for **all** sites at once, edit
 | `does not look like a valid domain name` | Pass a full FQDN, e.g. `app.example.com`, not a bare hostname or URL. |
 | `upstream must be an http:// or https:// URL` | Include the scheme: `upstream=http://127.0.0.1:3000`. |
 | Certbot fails to issue | DNS `A` record isn't pointing at this server yet, or port 80 is blocked/firewalled. Fix DNS/firewall and re-run. |
+| `<domain> port 80 is not served by this NGINX` | The pre-flight probe got a response that didn't come from this NGINX. Either DNS points at another server or something else (an app, a Docker container) owns port 80. The error lists the responding IP, its `Server`/`Location` headers, and what's listening on `:80` locally. |
+| `WARNING: could not connect to ... from this server` | The pre-flight probe couldn't connect at all, e.g. a firewall, or NAT that won't route the server back to its own public IP. The script continues, and Certbot gives the authoritative answer. |
 | `WARNING: '<domain>' has no A record yet` | DNS hasn't propagated. Wait, then re-run. |
 | `502 Bad Gateway` | The upstream app isn't running or isn't listening on the URL you gave. |
 | `cannot load certificate ... No such file or directory` | The config points to a missing/broken Certbot lineage. Re-run this script for that domain; it temporarily restores HTTP, obtains the certificate, verifies the PEM files, then enables HTTPS. |

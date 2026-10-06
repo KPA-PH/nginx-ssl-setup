@@ -336,6 +336,74 @@ nginx -t
 systemctl reload nginx
 
 # ---------------------------------------------------------------------------
+# 4b. Pre-flight: prove http://DOMAIN/.well-known/acme-challenge/ reaches THIS
+#     NGINX before asking Let's Encrypt. `nginx -t` and `systemctl reload`
+#     succeed even when another server or program answers port 80, which would
+#     otherwise only surface as an opaque certbot "unauthorized ... 404".
+# ---------------------------------------------------------------------------
+ACME_DIR="/var/www/certbot/.well-known/acme-challenge"
+PROBE_TOKEN="nginx-sh-preflight-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+PROBE_FILE="${ACME_DIR}/${PROBE_TOKEN}"
+PROBE_URL="http://${DOMAIN}/.well-known/acme-challenge/${PROBE_TOKEN}"
+
+echo "==> Checking that $DOMAIN port 80 is served by this NGINX..."
+mkdir -p "$ACME_DIR"
+trap 'rm -f "$PROBE_FILE"' EXIT
+printf '%s' "$PROBE_TOKEN" > "$PROBE_FILE"
+chmod 644 "$PROBE_FILE"
+
+# Mirror Let's Encrypt: follow up to 10 redirects and ignore certificate errors
+# on HTTPS redirects. Retry briefly on a wrong answer because `systemctl reload`
+# returns before the new workers have taken over.
+PROBE_OK=false
+for attempt in 1 2 3 4 5; do
+  PROBE_RESULT="$(curl -sS -L --max-redirs 10 -k --max-time 10 \
+    -w '\n%{http_code} %{remote_ip}' "$PROBE_URL")" || true
+  PROBE_META="${PROBE_RESULT##*$'\n'}"
+  PROBE_BODY="${PROBE_RESULT%$'\n'*}"
+  PROBE_CODE="${PROBE_META%% *}"
+  PROBE_CODE="${PROBE_CODE:-000}"
+  PROBE_IP="${PROBE_META#* }"
+
+  if [[ "$PROBE_CODE" == "200" && "$PROBE_BODY" == "$PROBE_TOKEN" ]]; then
+    PROBE_OK=true
+    break
+  fi
+  [[ "$PROBE_CODE" == "000" ]] && break   # connection failure; retrying won't help
+  sleep 1
+done
+
+if [[ "$PROBE_OK" == true ]]; then
+  echo "==> ACME challenge path is served by this NGINX."
+elif [[ "$PROBE_CODE" == "000" ]]; then
+  # A firewall or a NAT that won't route this server back to its own public IP
+  # also lands here, while Let's Encrypt (connecting from outside) may succeed.
+  echo "WARNING: could not connect to $PROBE_URL from this server."
+  echo "         Continuing; Certbot will report whether Let's Encrypt can reach it."
+else
+  {
+    echo "Error: $DOMAIN port 80 is not served by this NGINX, so Let's Encrypt's"
+    echo "       HTTP-01 challenge would fail. No certificate was requested."
+    echo "       Probe:    $PROBE_URL"
+    echo "       Expected: HTTP 200 with the token written to $ACME_DIR"
+    echo "       Got:      HTTP $PROBE_CODE from ${PROBE_IP:-unknown}: $(printf '%s' "$PROBE_BODY" | tr '\r\n\t' '   ' | cut -c1-120)"
+    echo "       First response headers:"
+    curl -sS --max-time 10 -o /dev/null -D - "$PROBE_URL" 2>&1 \
+      | grep -iE '^(HTTP/|server:|location:|curl:)' | sed 's/^/         /' || true
+    echo "       Listening on port 80 here:"
+    ss -ltnp 'sport = :80' 2>&1 | sed 's/^/         /' || true
+    echo "       This server's addresses: $(hostname -I 2>/dev/null || echo unknown)"
+    echo "       Common causes:"
+    echo "         - DNS for $DOMAIN points at a different server than this one"
+    echo "         - another program or container owns port 80 (check 'docker ps')"
+  } >&2
+  exit 1
+fi
+
+rm -f "$PROBE_FILE"
+trap - EXIT
+
+# ---------------------------------------------------------------------------
 # 5. Obtain Let's Encrypt certificate (webroot — matches the config above)
 # ---------------------------------------------------------------------------
 # A directory alone is not proof that the certificate is usable: Certbot's
